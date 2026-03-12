@@ -1,0 +1,1275 @@
+================================================================================
+LINKEDIN RECRUITER - CANDIDATE TRACKER EXTENSION
+WORKFLOW AND INTEGRATION DOCUMENTATION
+================================================================================
+
+Version: 2.0.0
+Last Updated: February 10, 2026
+Extension Type: Chrome Extension (Manifest V3)
+Purpose: Track LinkedIn candidates in real-time using Google Sheets as database
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. Overview
+2. Architecture Components
+3. Detailed Workflow
+4. Data Flow & Processing
+5. Google Sheets Integration
+6. Message Passing Protocol
+7. Extension API Reference
+8. Integration Points for Other Extensions
+9. Configuration & Setup
+10. Security & Authentication
+11. Error Handling
+12. Extension Lifecycle
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+The LinkedIn Recruiter - Candidate Tracker is a Chrome extension that helps 
+recruiters avoid processing the same candidate multiple times. It automatically 
+tracks visited LinkedIn profiles and stores candidate data in Google Sheets.
+
+KEY FEATURES:
+- Automatic candidate detection on LinkedIn pages
+- Real-time duplicate checking using Google Sheets API
+- Visual banners to indicate candidate status (new/already processed)
+- Data extraction from LinkedIn profiles (name, headline, experience, education)
+- No backend server required - uses Google Sheets as database
+- Team collaboration via shared Google Sheets
+- Service account authentication (JWT-based)
+
+SUPPORTED LINKEDIN PAGES:
+- LinkedIn Recruiter pages (linkedin.com/recruiter/*)
+- LinkedIn Talent pages (linkedin.com/talent/*)
+- Public LinkedIn profiles (linkedin.com/in/*)
+
+================================================================================
+2. ARCHITECTURE COMPONENTS
+================================================================================
+
+The extension consists of the following components:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        CHROME EXTENSION                          │
+│                                                                  │
+│  ┌──────────────┐    ┌──────────────┐    ┌─────────────────┐  │
+│  │  Popup UI    │    │  Background  │    │  Content Script │  │
+│  │  (popup.js)  │    │  Service     │    │  (content.js)   │  │
+│  │              │    │  Worker      │    │                 │  │
+│  │  - Status    │    │  (background │    │  - Profile      │  │
+│  │  - Actions   │    │  .js)        │    │    Detection    │  │
+│  │  - Stats     │    │              │    │  - Data Extract │  │
+│  └──────────────┘    │  - Extension │    │  - API Calls    │  │
+│                      │    Lifecycle │    │  - UI Banners   │  │
+│  ┌──────────────┐    │  - Message   │    └─────────────────┘  │
+│  │  Settings    │    │    Router    │                          │
+│  │  Page        │    └──────────────┘    ┌─────────────────┐  │
+│  │  (settings.  │                        │  Google Sheets  │  │
+│  │  js/html)    │                        │  DB Module      │  │
+│  │              │                        │  (google-sheets │  │
+│  │  - Config    │                        │  -db.js)        │  │
+│  │  - Auth      │                        │                 │  │
+│  │  - Test      │                        │  - JWT Auth     │  │
+│  └──────────────┘                        │  - CRUD Ops     │  │
+│                                          └─────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                            │
+                            │ HTTPS API Calls
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    GOOGLE CLOUD PLATFORM                         │
+│                                                                  │
+│  ┌──────────────────────┐       ┌────────────────────────┐     │
+│  │  OAuth 2.0 Token     │       │  Google Sheets API     │     │
+│  │  Endpoint            │       │  (sheets.googleapis.   │     │
+│  │                      │       │  com/v4)               │     │
+│  │  - JWT Exchange      │       │                        │     │
+│  │  - Access Token      │       │  - Read (GET)          │     │
+│  └──────────────────────┘       │  - Write (POST)        │     │
+│                                 │  - Update (PUT)        │     │
+│                                 └────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+                            │
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      GOOGLE SHEETS                               │
+│                                                                  │
+│  Sheet1 (Candidates Database)                                   │
+│  ───────────────────────────────────────────────────────────    │
+│  | ID | LinkedIn ID | Full Name | Headline | Designation |...  │
+│  ───────────────────────────────────────────────────────────    │
+│  | 1  | john-doe    | John Doe  | Engineer | Developer   |...  │
+│  | 2  | jane-smith  | Jane Smith| Manager  | PM          |...  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+COMPONENT DESCRIPTIONS:
+
+A. POPUP UI (popup.html, popup.js):
+   - Extension icon popup interface
+   - Shows configuration status
+   - Displays candidate count
+   - Actions: Recheck, View Sheet, Settings, Delete
+
+B. BACKGROUND SERVICE WORKER (background.js):
+   - Handles extension lifecycle events (install, update, startup)
+   - Routes messages between popup and content scripts
+   - Manages extension state
+
+C. CONTENT SCRIPT (content.js):
+   - Injected into LinkedIn pages
+   - Detects LinkedIn member IDs from URL/DOM
+   - Extracts candidate profile data
+   - Calls Google Sheets API to check/save candidates
+   - Displays status banners on LinkedIn pages
+
+D. SETTINGS PAGE (settings.html, settings.js):
+   - Configuration interface for Google Sheets API
+   - Service account credential input
+   - Sheet ID configuration
+   - Connection testing
+
+E. GOOGLE SHEETS DB MODULE (google-sheets-db.js):
+   - Abstracts Google Sheets API interactions
+   - JWT token generation and signing (using jsrsasign library)
+   - OAuth 2.0 authentication flow
+   - CRUD operations (Create, Read, Update, Delete)
+   - Token caching and refresh
+
+================================================================================
+3. DETAILED WORKFLOW
+================================================================================
+
+WORKFLOW STEP-BY-STEP:
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 1: EXTENSION INITIALIZATION                                │
+└──────────────────────────────────────────────────────────────────┘
+
+1. User installs extension
+   ↓
+2. background.js: chrome.runtime.onInstalled event fires
+   ↓
+3. Extension opens settings.html (options page)
+   ↓
+4. User configures Google Sheets credentials:
+   - Service account email (client_email)
+   - Private key (private_key)
+   - Sheet ID (sheet_id)
+   ↓
+5. settings.js saves config to chrome.storage.sync
+   ↓
+6. Extension ready for use
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 2: LINKEDIN PAGE VISIT                                     │
+└──────────────────────────────────────────────────────────────────┘
+
+1. User navigates to LinkedIn profile page
+   (e.g., https://www.linkedin.com/in/john-doe/)
+   ↓
+2. Chrome detects URL matches content_scripts pattern in manifest.json
+   ↓
+3. Chrome injects content scripts in this order:
+   a. jsrsasign.min.js (RSA signing library)
+   b. google-sheets-db.js (Database module)
+   c. content.js (Main logic)
+   d. styles.css (Banner styles)
+   ↓
+4. content.js executes initialization
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 3: MEMBER ID EXTRACTION                                    │
+└──────────────────────────────────────────────────────────────────┘
+
+1. content.js calls extractMemberId() function
+   ↓
+2. Extraction attempts (in priority order):
+   a. URL parameter: ?profileId={id}
+   b. Talent URL: /talent/profile/{id}
+   c. Recruiter URL: /recruiter/profile/{id}
+   d. Public profile: /in/{id}/
+   e. DOM attribute: [data-member-id]
+   ↓
+3. If member ID found → proceed to Phase 4
+   If not found → wait for URL change and retry
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 4: PROFILE DATA EXTRACTION                                 │
+└──────────────────────────────────────────────────────────────────┘
+
+1. content.js calls extractProfileData(memberId)
+   ↓
+2. DOM scraping using CSS selectors:
+   
+   A. FULL NAME:
+      - Selectors: h1.text-heading-xlarge, div.pv-text-details h1, etc.
+      - Fallback: Meta tag og:title, document.title
+      - Validation: Exclude "LinkedIn" text, company names
+   
+   B. HEADLINE:
+      - Selectors: .text-body-medium.break-words, etc.
+      - Fallback: Meta description
+      - Cleaning: Remove duplicated text
+   
+   C. LOCATION:
+      - Selectors: span.text-body-small, .pv-top-card .text-body-small
+      - Validation: Exclude followers/connections text
+   
+   D. CURRENT COMPANY:
+      - Extract from Experience section (extractCurrentCompany)
+      - Find first entity with "Present" text
+      - Parse company name from subtitle
+   
+   E. EXPERIENCE DETAILS:
+      - extractLatestExperience() function:
+        * Job title (designation)
+        * Company name
+        * Years at current role
+        * Total years of experience
+   
+   F. EDUCATION:
+      - extractLatestEducation() function:
+        * Latest degree/qualification
+        * Passout year (graduation year)
+   
+   G. PROFILE URL:
+      - Clean URL (remove /details/experience sub-pages)
+      - Format: https://www.linkedin.com/in/{id}/
+   ↓
+3. Return profileData object with all fields
+   ↓
+4. Proceed to Phase 5
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 5: GOOGLE SHEETS AUTHENTICATION                            │
+└──────────────────────────────────────────────────────────────────┘
+
+1. content.js initializes GoogleSheetsDB instance
+   ↓
+2. Load credentials from chrome.storage.sync
+   ↓
+3. googleSheetsDB.authenticate() called
+   ↓
+4. Check if access token is cached and valid:
+   - If valid → use cached token
+   - If expired → proceed to step 5
+   ↓
+5. Generate JWT token:
+   a. Create JWT header: { alg: "RS256", typ: "JWT" }
+   b. Create JWT payload:
+      {
+        iss: client_email,
+        scope: "https://www.googleapis.com/auth/spreadsheets",
+        aud: "https://oauth2.googleapis.com/token",
+        exp: now + 3600,
+        iat: now
+      }
+   c. Base64URL encode header and payload
+   d. Sign with RSA-SHA256 using private key (jsrsasign library)
+   e. Concatenate: {header}.{payload}.{signature}
+   ↓
+6. Exchange JWT for access token:
+   POST https://oauth2.googleapis.com/token
+   Body: grant_type=jwt-bearer&assertion={jwt_token}
+   ↓
+7. Receive access token response:
+   {
+     access_token: "ya29.xxxxx",
+     expires_in: 3600,
+     token_type: "Bearer"
+   }
+   ↓
+8. Cache token with expiry timestamp
+   ↓
+9. Return access token for API calls
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 6: DUPLICATE CHECK                                         │
+└──────────────────────────────────────────────────────────────────┘
+
+1. content.js calls googleSheetsDB.candidateExists(linkedInId)
+   ↓
+2. API call to Google Sheets:
+   GET https://sheets.googleapis.com/v4/spreadsheets/{sheetId}/values/Sheet1!B:M
+   Headers: Authorization: Bearer {access_token}
+   ↓
+3. Receive sheet data (all rows, columns B to M):
+   {
+     values: [
+       ["LinkedIn ID", "Full Name", ..., "Processed By"],
+       ["john-doe", "John Doe", ..., "recruiter1@example.com"],
+       ...
+     ]
+   }
+   ↓
+4. Search for matching LinkedIn ID in column B (index 0):
+   - Skip header row (index 0)
+   - Compare each row's linkedInId with current profile
+   ↓
+5. If match found:
+   - Extract "Processed By" field (column M, index 11)
+   - Return { exists: true, processedBy: "recruiter1@example.com" }
+   ↓
+6. If no match:
+   - Return { exists: false, processedBy: "" }
+   ↓
+7. Proceed to Phase 7
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 7: UI BANNER DISPLAY                                       │
+└──────────────────────────────────────────────────────────────────┘
+
+1. Based on candidateExists() result:
+
+   A. IF CANDIDATE EXISTS (DUPLICATE):
+      ↓
+      Display RED WARNING BANNER:
+      ┌─────────────────────────────────────────────────────────┐
+      │ ⚠️ CANDIDATE ALREADY PROCESSED                          │
+      │                                                         │
+      │ This candidate was already processed by:                │
+      │ recruiter1@example.com                                  │
+      │                                                         │
+      │ Date: 2026-02-08                                        │
+      │                                                         │
+      │ [Remove from List] button                              │
+      └─────────────────────────────────────────────────────────┘
+      ↓
+      Position: Top of LinkedIn page, fixed overlay
+      Style: Red background, white text, high z-index
+      ↓
+      END (don't save to sheet again)
+
+   B. IF CANDIDATE IS NEW:
+      ↓
+      Display GREEN SUCCESS BANNER (temporary):
+      ┌─────────────────────────────────────────────────────────┐
+      │ ✓ NEW CANDIDATE                                         │
+      │                                                         │
+      │ Profile processed and saved to database                 │
+      │                                                         │
+      │ Name: John Doe                                          │
+      │ Headline: Software Engineer at TechCorp                 │
+      └─────────────────────────────────────────────────────────┘
+      ↓
+      Position: Top of LinkedIn page, fixed overlay
+      Style: Green background, white text
+      Duration: Auto-hide after 5 seconds
+      ↓
+      Proceed to Phase 8 (save to sheet)
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 8: SAVE TO GOOGLE SHEETS                                   │
+└──────────────────────────────────────────────────────────────────┘
+
+1. content.js calls googleSheetsDB.saveCandidate(profileData)
+   ↓
+2. Prepare row data array (matching sheet columns):
+   [
+     new Date().toISOString(),        // A: Timestamp
+     linkedInId,                      // B: LinkedIn ID
+     full_name,                       // C: Full Name
+     headline,                        // D: Headline
+     designation,                     // E: Designation
+     location,                        // F: Location
+     current_company,                 // G: Current Company
+     years_at_current,                // H: Years at Current Role
+     total_years_experience,          // I: Total Years Experience
+     qualification,                   // J: Qualification
+     passout,                         // K: Passout Year
+     profile_url,                     // L: Profile URL
+     user_email                       // M: Processed By
+   ]
+   ↓
+3. API call to append row:
+   POST https://sheets.googleapis.com/v4/spreadsheets/{sheetId}/values/Sheet1!A:M:append
+   Query params: ?valueInputOption=USER_ENTERED
+   Headers: Authorization: Bearer {access_token}
+   Body: {
+     "values": [row_data_array]
+   }
+   ↓
+4. Receive success response:
+   {
+     "updates": {
+       "spreadsheetId": "...",
+       "updatedRange": "Sheet1!A123:M123",
+       "updatedRows": 1,
+       "updatedColumns": 13
+     }
+   }
+   ↓
+5. Log success and update UI banner
+   ↓
+6. Send message to background script:
+   chrome.runtime.sendMessage({
+     action: 'candidateProcessed',
+     candidateName: full_name
+   })
+   ↓
+7. END
+
+┌──────────────────────────────────────────────────────────────────┐
+│ PHASE 9: USER ACTIONS (OPTIONAL)                                 │
+└──────────────────────────────────────────────────────────────────┘
+
+USER ACTION: Recheck Current Profile
+   ↓
+1. User clicks "Recheck" in popup
+   ↓
+2. popup.js sends message to content script:
+   chrome.tabs.sendMessage(tabId, { action: 'recheck' })
+   ↓
+3. content.js receives message and re-runs entire workflow
+   (Phases 3-8)
+
+USER ACTION: Delete Candidate
+   ↓
+1. User clicks "Remove from List" button on banner OR
+   User clicks "Delete" in popup
+   ↓
+2. content.js calls googleSheetsDB.deleteCandidate(linkedInId)
+   ↓
+3. API calls to Google Sheets:
+   a. GET existing data to find row number
+   b. DELETE the row:
+      POST https://sheets.googleapis.com/v4/spreadsheets/{sheetId}:batchUpdate
+      Body: {
+        "requests": [{
+          "deleteDimension": {
+            "range": {
+              "sheetId": 0,
+              "dimension": "ROWS",
+              "startIndex": rowIndex,
+              "endIndex": rowIndex + 1
+            }
+          }
+        }]
+      }
+   ↓
+4. Remove banner from page and show success message
+
+USER ACTION: View All Candidates
+   ↓
+1. User clicks "View All" in popup
+   ↓
+2. popup.js retrieves sheet_id from chrome.storage.sync
+   ↓
+3. Open Google Sheets in new tab:
+   https://docs.google.com/spreadsheets/d/{sheet_id}/edit
+
+================================================================================
+4. DATA FLOW & PROCESSING
+================================================================================
+
+DATA FLOW DIAGRAM:
+
+LinkedIn Page → Content Script → Google Sheets DB → Google API → Sheet
+      ↑              ↓                   ↓              ↓          |
+      |         Extract Data        Authenticate   Exchange JWT   |
+      |              ↓                   ↓              ↓          |
+      |         Check Duplicate ← Check Exists ← GET Request      |
+      |              ↓                                             |
+      |         Display Banner                                    |
+      |              ↓                                             |
+      └────── Save if New ──→ Append Row ──→ POST Request ────────┘
+
+DATA STRUCTURES:
+
+A. PROFILE DATA OBJECT (extracted from LinkedIn):
+{
+  member_id: "john-doe",                    // LinkedIn profile ID
+  full_name: "John Doe",                    // Candidate's full name
+  headline: "Software Engineer at TechCorp",// Profile headline
+  designation: "Senior Software Engineer",  // Job title
+  location: "San Francisco, CA",            // Current location
+  current_company: "TechCorp",              // Current employer
+  years_at_current: "2 yrs",               // Years at current role
+  total_years_experience: "5 yrs",         // Total work experience
+  qualification: "B.Tech in Computer Science", // Latest degree
+  passout: "2019",                          // Graduation year
+  profile_url: "https://www.linkedin.com/in/john-doe/"
+}
+
+B. GOOGLE SHEETS ROW FORMAT:
+Column A: Timestamp (ISO 8601)
+Column B: LinkedIn ID (member_id)
+Column C: Full Name
+Column D: Headline
+Column E: Designation
+Column F: Location
+Column G: Current Company
+Column H: Years at Current Role
+Column I: Total Years Experience
+Column J: Qualification
+Column K: Passout Year
+Column L: Profile URL
+Column M: Processed By (user email)
+
+C. CONFIGURATION OBJECT (stored in chrome.storage.sync):
+{
+  client_email: "service-account@project.iam.gserviceaccount.com",
+  private_key: "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
+  sheet_id: "1abcdefghijklmnopqrstuvwxyz",
+  user_email: "recruiter@company.com"  // Optional: who processed
+}
+
+D. AUTHENTICATION TOKEN OBJECT:
+{
+  access_token: "ya29.a0AfB_byC...",  // Google OAuth access token
+  token_type: "Bearer",
+  expires_in: 3600                     // Token lifetime in seconds
+}
+
+PROCESSING LOGIC:
+
+1. DEBOUNCING:
+   - MIN_PROCESS_INTERVAL = 1500ms
+   - Prevents multiple rapid checks on same page
+   - Uses lastProcessTime timestamp to throttle
+
+2. DUPLICATE PREVENTION:
+   - Global flag: processingInProgress
+   - Checks if already processing current member ID
+   - Prevents race conditions
+
+3. URL CHANGE DETECTION:
+   - Monitors window.location.href changes
+   - Re-triggers workflow when navigating to different profile
+   - Debounce delay to prevent excessive checks
+
+4. ERROR RECOVERY:
+   - Try-catch blocks around all API calls
+   - Fallback to default values if extraction fails
+   - User-friendly error messages in banners
+
+================================================================================
+5. GOOGLE SHEETS INTEGRATION
+================================================================================
+
+GOOGLE SHEETS API ENDPOINTS USED:
+
+1. AUTHENTICATE:
+   POST https://oauth2.googleapis.com/token
+   - Exchange JWT for access token
+   - Service account authentication
+
+2. READ DATA (Check for duplicates):
+   GET https://sheets.googleapis.com/v4/spreadsheets/{sheetId}/values/{range}
+   Example: GET .../values/Sheet1!B:M
+   - Returns all rows in specified range
+   - Used to check if candidate exists
+
+3. APPEND DATA (Save new candidate):
+   POST https://sheets.googleapis.com/v4/spreadsheets/{sheetId}/values/{range}:append
+   Example: POST .../values/Sheet1!A:M:append?valueInputOption=USER_ENTERED
+   - Appends new row to end of sheet
+   - Auto-increments row number
+
+4. UPDATE DATA (Modify existing candidate):
+   PUT https://sheets.googleapis.com/v4/spreadsheets/{sheetId}/values/{range}
+   Example: PUT .../values/Sheet1!A10:M10
+   - Updates specific row
+   - Used for editing candidate info
+
+5. DELETE DATA (Remove candidate):
+   POST https://sheets.googleapis.com/v4/spreadsheets/{sheetId}:batchUpdate
+   Body: deleteDimension request
+   - Deletes entire row
+   - Shifts remaining rows up
+
+SHEET STRUCTURE REQUIREMENTS:
+
+Sheet Name: "Sheet1" (configurable in code)
+
+Header Row (Row 1):
+| A          | B           | C         | D        | E           | F        | G               | H                | I                     | J             | K           | L           | M            |
+|------------|-------------|-----------|----------|-------------|----------|-----------------|------------------|-----------------------|---------------|-------------|-------------|--------------|
+| Timestamp  | LinkedIn ID | Full Name | Headline | Designation | Location | Current Company | Years at Current | Total Years Experience| Qualification | Passout Year| Profile URL | Processed By |
+
+Data Rows (Row 2+):
+Auto-populated by extension
+
+PERMISSIONS REQUIRED:
+- Google Sheets API scope: https://www.googleapis.com/auth/spreadsheets
+- Service account must have Editor access to the sheet
+
+================================================================================
+6. MESSAGE PASSING PROTOCOL
+================================================================================
+
+Chrome extensions use message passing for communication between components.
+
+MESSAGE TYPES AND STRUCTURE:
+
+A. POPUP → CONTENT SCRIPT:
+
+1. Recheck Current Profile:
+   {
+     action: "recheck"
+   }
+   Response: { success: true } or { success: false, error: "..." }
+
+2. Delete Current Candidate:
+   {
+     action: "deleteCurrentCandidate"
+   }
+   Response: { success: true } or { success: false, error: "..." }
+
+B. CONTENT SCRIPT → BACKGROUND:
+
+1. Candidate Processed Notification:
+   {
+     action: "candidateProcessed",
+     candidateName: "John Doe"
+   }
+   No response expected (fire-and-forget)
+
+2. Candidate Already Exists Notification:
+   {
+     action: "candidateExists",
+     candidateName: "John Doe"
+   }
+   No response expected (fire-and-forget)
+
+C. SETTINGS PAGE ↔ CHROME STORAGE:
+
+1. Save Configuration:
+   chrome.storage.sync.set({ googleSheetsConfig: {...} })
+
+2. Load Configuration:
+   chrome.storage.sync.get(['googleSheetsConfig'], callback)
+
+MESSAGE PASSING CODE EXAMPLES:
+
+// Send message from popup to content script
+chrome.tabs.sendMessage(tabId, { action: 'recheck' }, (response) => {
+  if (chrome.runtime.lastError) {
+    console.error('Error:', chrome.runtime.lastError);
+  } else {
+    console.log('Response:', response);
+  }
+});
+
+// Receive message in content script
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'recheck') {
+    // Re-run check logic
+    sendResponse({ success: true });
+  }
+  return true; // Keep channel open for async response
+});
+
+// Send message to background script (fire-and-forget)
+chrome.runtime.sendMessage({
+  action: 'candidateProcessed',
+  candidateName: 'John Doe'
+});
+
+================================================================================
+7. EXTENSION API REFERENCE
+================================================================================
+
+This section documents the key functions and APIs that other extensions
+can integrate with or extend.
+
+CONTENT SCRIPT API (content.js):
+
+1. extractMemberId()
+   Returns: string | null
+   Description: Extracts LinkedIn member ID from current page URL or DOM
+
+2. extractProfileData(memberId)
+   Parameters: memberId (string)
+   Returns: object | null
+   Description: Scrapes and returns candidate profile data
+
+3. initializeGoogleSheetsDB()
+   Returns: Promise<boolean>
+   Description: Initializes Google Sheets DB with stored credentials
+
+4. checkAndProcessCandidate(memberId)
+   Parameters: memberId (string)
+   Returns: Promise<void>
+   Description: Main workflow - checks duplicate and processes candidate
+
+5. displayBanner(type, data)
+   Parameters: 
+     - type: "exists" | "saved" | "error"
+     - data: object with message and details
+   Returns: void
+   Description: Shows status banner on LinkedIn page
+
+6. removeBanner()
+   Returns: void
+   Description: Removes any existing banner from page
+
+GOOGLE SHEETS DB API (google-sheets-db.js):
+
+Class: GoogleSheetsDB
+
+Constructor:
+  new GoogleSheetsDB()
+
+Properties:
+  - credentials: object
+  - accessToken: string
+  - tokenExpiry: number
+  - apiUrl: string
+
+Methods:
+
+1. authenticate()
+   Returns: Promise<string> (access token)
+   Description: Authenticates with Google API using JWT
+
+2. candidateExists(linkedInId)
+   Parameters: linkedInId (string)
+   Returns: Promise<{exists: boolean, processedBy: string}>
+   Description: Checks if candidate already in sheet
+
+3. saveCandidate(profileData)
+   Parameters: profileData (object)
+   Returns: Promise<boolean>
+   Description: Appends new candidate row to sheet
+
+4. deleteCandidate(linkedInId)
+   Parameters: linkedInId (string)
+   Returns: Promise<boolean>
+   Description: Removes candidate from sheet
+
+5. updateCandidate(linkedInId, updates)
+   Parameters: 
+     - linkedInId (string)
+     - updates (object)
+   Returns: Promise<boolean>
+   Description: Updates existing candidate data
+
+6. getAllCandidates()
+   Returns: Promise<Array<object>>
+   Description: Fetches all candidate records
+
+7. loadCredentials()
+   Returns: Promise<boolean>
+   Description: Loads config from chrome.storage.sync
+
+8. saveCredentials(config)
+   Parameters: config (object)
+   Returns: Promise<boolean>
+   Description: Saves config to chrome.storage.sync
+
+POPUP API (popup.js):
+
+1. checkConfigurationStatus()
+   Returns: Promise<boolean>
+   Description: Checks if Google Sheets is configured
+
+2. getTotalCandidates()
+   Returns: Promise<void>
+   Description: Fetches and displays candidate count
+
+3. showStatus(message, type)
+   Parameters:
+     - message (string)
+     - type: "info" | "success" | "error"
+   Returns: void
+   Description: Shows temporary status message in popup
+
+SETTINGS API (settings.js):
+
+1. saveSettings()
+   Returns: Promise<void>
+   Description: Saves configuration to chrome.storage.sync
+
+2. loadSettings()
+   Returns: Promise<void>
+   Description: Loads configuration from storage and populates form
+
+3. testConnection()
+   Returns: Promise<void>
+   Description: Tests Google Sheets API connection
+
+================================================================================
+8. INTEGRATION POINTS FOR OTHER EXTENSIONS
+================================================================================
+
+This section describes how other Chrome extensions can integrate with or
+extend this LinkedIn Candidate Tracker extension.
+
+INTEGRATION METHODS:
+
+A. SHARED STORAGE:
+   
+   Other extensions can read/write to chrome.storage.sync to access
+   configuration or share data:
+
+   // Read Google Sheets config
+   chrome.storage.sync.get(['googleSheetsConfig'], (result) => {
+     const config = result.googleSheetsConfig;
+     console.log('Sheet ID:', config.sheet_id);
+   });
+
+   // Write custom data (use a unique key to avoid conflicts)
+   chrome.storage.sync.set({ myExtensionData: {...} });
+
+B. MESSAGE PASSING (CROSS-EXTENSION):
+
+   Other extensions can send messages using chrome.runtime.sendMessage
+   with this extension's ID:
+
+   chrome.runtime.sendMessage(
+     'YOUR_EXTENSION_ID_HERE',
+     { action: 'getCandidate', linkedInId: 'john-doe' },
+     (response) => {
+       console.log('Candidate data:', response);
+     }
+   );
+
+   To receive messages from other extensions, add to background.js:
+
+   chrome.runtime.onMessageExternal.addListener(
+     (request, sender, sendResponse) => {
+       if (request.action === 'getCandidate') {
+         // Fetch and return candidate data
+         sendResponse({ data: {...} });
+       }
+     }
+   );
+
+C. CONTENT SCRIPT INJECTION:
+
+   Other extensions can inject their own content scripts on LinkedIn
+   pages and access the global objects/functions:
+
+   // Access the GoogleSheetsDB instance
+   if (window.googleSheetsDB) {
+     window.googleSheetsDB.candidateExists('john-doe')
+       .then(result => console.log(result));
+   }
+
+   // Access extracted profile data
+   if (window.extractProfileData) {
+     const data = window.extractProfileData('john-doe');
+   }
+
+D. GOOGLE SHEETS SHARING:
+
+   Multiple extensions can read from the same Google Sheet by:
+   1. Using the same service account credentials
+   2. Each extension uses its own service account with Editor access
+   3. Reading data via Google Sheets API
+
+E. DOM EVENTS:
+
+   This extension fires custom DOM events that other extensions can listen to:
+
+   // Listen for candidate processing events
+   document.addEventListener('linkedin-candidate-processed', (event) => {
+     console.log('Candidate processed:', event.detail);
+   });
+
+   // Listen for candidate exists events
+   document.addEventListener('linkedin-candidate-exists', (event) => {
+     console.log('Duplicate found:', event.detail);
+   });
+
+   To fire these events, add to content.js:
+
+   const event = new CustomEvent('linkedin-candidate-processed', {
+     detail: { memberId: '...', fullName: '...' }
+   });
+   document.dispatchEvent(event);
+
+INTEGRATION USE CASES:
+
+1. CRM Integration:
+   - Listen for 'linkedin-candidate-processed' events
+   - Automatically create lead/contact in CRM system
+   - Sync candidate data
+
+2. Email Automation:
+   - Monitor Google Sheet for new candidates
+   - Trigger automated outreach emails
+   - Track responses
+
+3. Analytics Dashboard:
+   - Read Google Sheet data
+   - Generate recruitment metrics
+   - Visualize candidate pipeline
+
+4. Enhanced Profile Scraping:
+   - Extend extractProfileData() to extract additional fields
+   - Save custom fields to sheet (add new columns)
+   - Advanced data parsing
+
+5. Multi-Platform Tracking:
+   - Track candidates across LinkedIn, Indeed, GitHub, etc.
+   - Consolidate in single Google Sheet
+   - Unified duplicate detection
+
+MODIFYING THE EXTENSION:
+
+To extend functionality, modify these files:
+
+1. Add new columns to Google Sheet:
+   - Update SHEET_COLUMNS in content.js
+   - Modify extractProfileData() to include new fields
+   - Update saveCandidate() row data array
+
+2. Add new UI actions:
+   - Add buttons to popup.html
+   - Implement handlers in popup.js
+   - Add message listeners in content.js
+
+3. Add custom scraping logic:
+   - Create new extraction functions in content.js
+   - Use CSS selectors to target LinkedIn elements
+   - Add to extractProfileData() return object
+
+4. Change sheet structure:
+   - Modify range in candidateExists() and saveCandidate()
+   - Update column mappings
+   - Adjust header row
+
+================================================================================
+9. CONFIGURATION & SETUP
+================================================================================
+
+GOOGLE CLOUD SETUP:
+
+1. Create Google Cloud Project:
+   - Go to console.cloud.google.com
+   - Create new project
+   - Enable Google Sheets API
+
+2. Create Service Account:
+   - Navigate to IAM & Admin → Service Accounts
+   - Click "Create Service Account"
+   - Name: "linkedin-tracker"
+   - Role: None needed (sheet-level permissions used)
+   - Create and download JSON key file
+
+3. Create Google Sheet:
+   - Go to sheets.google.com
+   - Create new sheet
+   - Name it "LinkedIn Candidates"
+   - Add header row (see Sheet Structure section)
+   - Share with service account email (Editor access)
+
+4. Extract Credentials:
+   From the JSON key file, extract:
+   - client_email
+   - private_key
+   - Get sheet_id from sheet URL
+
+EXTENSION CONFIGURATION:
+
+1. Install extension (load unpacked)
+2. Click extension icon → Settings
+3. Paste credentials:
+   - Service Account Email
+   - Private Key (entire PEM block)
+   - Sheet ID (from URL)
+   - Your Email (optional)
+4. Click "Test Connection"
+5. If successful, click "Save Settings"
+
+PERMISSIONS REQUIRED:
+
+manifest.json permissions:
+- "activeTab": Access current tab URL/title
+- "storage": Save configuration to chrome.storage
+- "scripting": Inject content scripts
+
+host_permissions:
+- "*://*.linkedin.com/*": Run on LinkedIn pages
+- "*://*.googleapis.com/*": Call Google APIs
+- "https://oauth2.googleapis.com/*": OAuth token exchange
+- "https://sheets.googleapis.com/*": Sheets API
+
+TROUBLESHOOTING:
+
+Common issues and solutions:
+
+1. "Credentials not configured":
+   → Go to Settings and enter Google Sheets API credentials
+
+2. "Authentication failed":
+   → Check private key format (must include BEGIN/END markers)
+   → Verify service account email is correct
+   → Ensure Google Sheets API is enabled
+
+3. "Failed to check candidate":
+   → Verify sheet ID is correct
+   → Check service account has Editor access to sheet
+   → Check sheet name is "Sheet1"
+
+4. Banner not showing:
+   → Refresh LinkedIn page
+   → Check browser console for errors
+   → Verify extension is enabled
+
+5. "Please refresh the LinkedIn page":
+   → Content script not loaded yet
+   → Refresh page and try again
+
+================================================================================
+10. SECURITY & AUTHENTICATION
+================================================================================
+
+AUTHENTICATION FLOW:
+
+1. Service Account Authentication:
+   - Uses Google Cloud service account
+   - JWT-based authentication
+   - No user login required
+
+2. JWT Token Generation:
+   - Header: Algorithm and token type
+   - Payload: Issuer, scope, audience, expiry
+   - Signature: RSA-SHA256 with private key
+
+3. Token Exchange:
+   - POST JWT to oauth2.googleapis.com/token
+   - Receive access token (1 hour lifetime)
+   - Cache token until expiry
+
+4. API Authorization:
+   - Add Bearer token to request headers
+   - Google validates token and checks permissions
+
+SECURITY CONSIDERATIONS:
+
+1. Private Key Storage:
+   - Stored in chrome.storage.sync (encrypted by Chrome)
+   - Synced across user's Chrome instances
+   - Not accessible to websites (only extension)
+
+2. Token Caching:
+   - Access token cached in memory (not persisted)
+   - Cleared when extension reloads
+   - Auto-refresh before expiry
+
+3. API Request Blocking:
+   - Blocks malformed fetch/XHR requests
+   - Validates URLs before making requests
+   - Prevents invalid API calls
+
+4. Sheet-Level Permissions:
+   - Service account only has access to shared sheet
+   - No access to user's other files
+   - Limited to Sheets API scope
+
+5. Content Security:
+   - Content script isolation (separate from page scripts)
+   - No eval() or inline scripts
+   - CSP compliant (Manifest V3)
+
+BEST PRACTICES:
+
+1. Rotate service account keys regularly
+2. Don't share private keys
+3. Use separate service accounts per team/environment
+4. Monitor API usage in Google Cloud Console
+5. Review sheet access permissions periodically
+
+================================================================================
+11. ERROR HANDLING
+================================================================================
+
+ERROR TYPES AND HANDLING:
+
+A. EXTRACTION ERRORS:
+
+1. Member ID Not Found:
+   - Retry after URL change
+   - Wait for DOM to load
+   - Fallback to alternate selectors
+
+2. Profile Data Incomplete:
+   - Use fallback values (empty strings)
+   - Continue processing with partial data
+   - Log missing fields for debugging
+
+B. AUTHENTICATION ERRORS:
+
+1. Invalid Credentials:
+   - Show error banner with instructions
+   - Prompt user to check Settings
+   - Provide helpful error message
+
+2. Token Expired:
+   - Automatically refresh token
+   - Retry failed request
+   - Transparent to user
+
+3. JWT Signing Failed:
+   - Check private key format
+   - Verify jsrsasign library loaded
+   - Display detailed error
+
+C. API ERRORS:
+
+1. Network Failure:
+   - Retry up to 3 times with exponential backoff
+   - Show temporary error banner
+   - Cache data for later retry
+
+2. Rate Limiting (429):
+   - Wait and retry after delay
+   - Implement exponential backoff
+   - Alert user if persistent
+
+3. Permission Denied (403):
+   - Check service account has Editor access
+   - Verify sheet ID is correct
+   - Show configuration error
+
+4. Not Found (404):
+   - Check sheet ID and sheet name
+   - Verify sheet exists
+   - Prompt user to check Settings
+
+D. GOOGLE SHEETS ERRORS:
+
+1. Sheet Structure Mismatch:
+   - Validate header row
+   - Check column count
+   - Provide fix instructions
+
+2. Quota Exceeded:
+   - Alert user
+   - Suggest waiting or upgrading plan
+   - Implement request throttling
+
+ERROR LOGGING:
+
+All errors logged to browser console with prefix:
+- [LinkedIn Tracker] General messages
+- [GoogleSheetsDB] Database-related messages
+
+Example:
+console.error('[GoogleSheetsDB] Authentication error:', error);
+
+USER-FACING ERROR MESSAGES:
+
+Display in banners or popup:
+- Simple, non-technical language
+- Actionable instructions
+- Links to relevant settings/help
+
+Example:
+"⚠️ Unable to connect to Google Sheets. Please check your configuration in Settings."
+
+================================================================================
+12. EXTENSION LIFECYCLE
+================================================================================
+
+LIFECYCLE EVENTS:
+
+1. INSTALLATION:
+   Event: chrome.runtime.onInstalled (reason: 'install')
+   Actions:
+   - Log installation
+   - Open settings page
+   - Initialize default configuration
+
+2. UPDATE:
+   Event: chrome.runtime.onInstalled (reason: 'update')
+   Actions:
+   - Log update
+   - Migrate old settings if needed
+   - Show "What's New" (optional)
+
+3. STARTUP:
+   Event: chrome.runtime.onStartup
+   Actions:
+   - Log startup
+   - Initialize service worker
+   - Clear expired cache
+
+4. CONTENT SCRIPT INJECTION:
+   Trigger: User navigates to LinkedIn page
+   Actions:
+   - Inject jsrsasign.min.js
+   - Inject google-sheets-db.js
+   - Inject content.js
+   - Inject styles.css
+   - Initialize tracking
+
+5. URL CHANGE:
+   Trigger: User navigates within LinkedIn
+   Actions:
+   - Detect URL change
+   - Extract new member ID
+   - Re-run workflow if different profile
+
+6. EXTENSION RELOAD:
+   Trigger: User reloads extension or Chrome restarts
+   Actions:
+   - Re-inject content scripts on active tabs
+   - Reload configuration from storage
+   - Re-authenticate with Google
+
+7. UNINSTALLATION:
+   Trigger: User uninstalls extension
+   Actions:
+   - Chrome clears storage automatically
+   - Remove injected content scripts
+   - No server-side cleanup needed
+
+STATE MANAGEMENT:
+
+1. Persistent State (chrome.storage.sync):
+   - Configuration (credentials, sheet ID)
+   - User preferences
+   - Synced across devices
+
+2. Session State (chrome.storage.local):
+   - Temporary cache
+   - Recent candidates
+   - Local to device
+
+3. In-Memory State:
+   - Access tokens
+   - Processing flags
+   - Current member ID
+   - Lost on extension reload
+
+PERFORMANCE CONSIDERATIONS:
+
+1. Debouncing:
+   - Limit processing to once per 1.5 seconds
+   - Prevent duplicate checks
+
+2. Caching:
+   - Cache access tokens (1 hour)
+   - Reduce authentication requests
+
+3. Lazy Loading:
+   - Don't process until member ID found
+   - Wait for DOM to stabilize
+
+4. Request Optimization:
+   - Batch API calls when possible
+   - Use minimal data ranges (columns B:M, not A:Z)
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
+
+For questions or support, please refer to:
+- README.md (project overview)
+- README_GOOGLE_SHEETS.md (setup guide)
+- SETUP_GOOGLE_SHEETS.md (detailed configuration)
+
+Version: 2.0.0
+Extension ID: [To be generated on Chrome Web Store]
+Manifest Version: 3
+Minimum Chrome Version: 88
+
+© 2026 Kushi Structural Consultancy Pvt Ltd
